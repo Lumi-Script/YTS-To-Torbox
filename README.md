@@ -20,7 +20,7 @@ curl -sL https://raw.githubusercontent.com/Lumi-Script/yts-to-torbox/refs/heads/
 
 
 ## Notes
-- Torbox has implemented a stated limit of 60/hour for adding torrents, I find this is actually closer to 300.
+- Torbox has implemented a stated limit of 60/hour for adding torrents which aren't cached, I'm oddly seeing this limit applied to this script too.
 - Given this, this script can take literally a week to run. Use screen or similar to run in the background.
 
 
