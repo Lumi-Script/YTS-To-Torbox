@@ -73,7 +73,7 @@ fetch_page() {
         RESPONSE=$(curl -s -w "\n%{http_code}" "$REQ_URL")
         STATUS=$(echo "$RESPONSE" | tail -n1)
         if [ "$STATUS" -eq 429 ]; then sleep 5; continue; fi
-        if [ "$STATUS" -ne 200 ]; then echo "Status ${STATUS} for page ${PAGE}. Retrying..."; continue; fi
+        if [ "$STATUS" -ne 200 ]; then continue; fi
 
         echo "$RESPONSE" | sed '$d' | jq -c '.data.movies[]? | {imdb: .imdb_code, torrents: [.torrents[]? | . + {
             score: ((if .video_codec == "x265" then 2 else 1 end) + (if .type == "bluray" then 2 else 1 end)),
@@ -86,8 +86,12 @@ fetch_page() {
 for PAGE in $(seq 1 $TOTAL_PAGES); do
     while [ $(jobs -rp | wc -l) -ge "$THREADS" ]; do sleep 0.05; done
     fetch_page "$PAGE" &
+    
+    # Progress Bar Update
     DONE=$(ls -1 "$TEMP_DIR"/page_*.json 2>/dev/null | wc -l)
-    printf "\rScraping: [%-40s] %d/%d" "$(printf '#%.0s' $(seq 1 $((DONE * 40 / TOTAL_PAGES))))" "$DONE" "$TOTAL_PAGES"
+    BARS=$(( DONE * 40 / TOTAL_PAGES ))
+    [ "$BARS" -gt 0 ] && BAR_STR=$(printf '%*s' "$BARS" "" | tr ' ' '#') || BAR_STR=""
+    printf "\rScraping: [%-40s] %d/%d" "$BAR_STR" "$DONE" "$TOTAL_PAGES"
 done
 
 wait
@@ -141,11 +145,9 @@ while true; do
     BODY=$(echo "$RES" | sed '$d')
     
     if [ "$STATUS" -eq 429 ]; then
-        echo -e "\nRate limited. Waiting 15s..."
         sleep 15
         continue
     elif [[ "$STATUS" =~ ^50[0-4]$ ]]; then
-        echo -e "\nServer overloaded ($STATUS). Waiting 15s..."
         sleep 15
         continue
     elif [ "$STATUS" -ne 200 ]; then
@@ -173,12 +175,10 @@ mv "$TEMP_DIR/new_selected_torrents.txt" "$TEMP_DIR/selected_torrents.txt"
 echo "Remaining new torrents to process: $(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ')"
 
 # --- PHASE 4: Torbox Cache Check (Dynamic Batching) ---
-# Calculate maximum safe hashes per batch based on OS ARG_MAX limit
 OS_ARG_MAX=$(getconf ARG_MAX 2>/dev/null || echo 2097152)
 SAFE_ARG_MAX=$(( OS_ARG_MAX * 9 / 10 ))
 CURRENT_BATCH_SIZE=$(( SAFE_ARG_MAX / 50 ))
 
-# Cap at 10,000 to prevent API payload/timeout errors based on server limits
 if [ "$CURRENT_BATCH_SIZE" -gt 10000 ]; then CURRENT_BATCH_SIZE=10000; fi
 
 TOTAL_HASHES=$(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ')
@@ -187,14 +187,11 @@ touch "$TEMP_DIR/raw_cached_hashes.txt"
 
 echo "Starting dynamic cache check. Max batch size: $CURRENT_BATCH_SIZE..."
 
-# Loop dynamically through the list using offset logic
 while [ "$CURRENT_OFFSET" -lt "$TOTAL_HASHES" ]; do
     REMAINING=$(( TOTAL_HASHES - CURRENT_OFFSET ))
     GRAB_COUNT=$(( CURRENT_BATCH_SIZE < REMAINING ? CURRENT_BATCH_SIZE : REMAINING ))
     
-    # Extract the exact block of hashes for this attempt
     tail -n +$(( CURRENT_OFFSET + 1 )) "$TEMP_DIR/selected_torrents.txt" | head -n "$GRAB_COUNT" > "$TEMP_DIR/current_batch.txt"
-    
     jq -R . < "$TEMP_DIR/current_batch.txt" | jq -s '{hashes: .}' > "$TEMP_DIR/current_payload.json"
     
     RES=$(curl -s -w "\n%{http_code}" -X POST "$TORBOX_CHECK_URL" \
@@ -205,30 +202,29 @@ while [ "$CURRENT_OFFSET" -lt "$TOTAL_HASHES" ]; do
     STATUS=$(echo "$RES" | tail -n1)
     
     if [ "$STATUS" -eq 429 ]; then
-        echo -e "\nRate limited (429). Waiting 15s..."
         sleep 15
         continue
     elif [[ "$STATUS" =~ ^50[0-4]$ ]] || [ "$STATUS" -eq 413 ] || [ "$STATUS" -eq 400 ]; then
-        # Handle 5xx errors or Payload Too Large by halving the batch size
         NEW_BATCH=$(( CURRENT_BATCH_SIZE / 2 ))
         if [ "$NEW_BATCH" -lt 50 ]; then
-            echo -e "\nFatal: Server keeps rejecting even small batches (Status: $STATUS). Response:"
-            echo "$RES" | sed '$d'
+            echo -e "\nFatal: Server keeps rejecting batches (Status: $STATUS)."
             break
         fi
-        echo -e "\nServer returned $STATUS. Dropping batch size from $CURRENT_BATCH_SIZE to $NEW_BATCH..."
         CURRENT_BATCH_SIZE=$NEW_BATCH
         sleep 5
-        continue # Retries the loop without increasing CURRENT_OFFSET
+        continue
     elif [ "$STATUS" -ne 200 ]; then
         echo -e "\nFatal Error: API returned status $STATUS"
         break
     fi
     
-    # Success: Save output and advance the offset
     echo "$RES" | sed '$d' | jq -r '.data | keys[]?' >> "$TEMP_DIR/raw_cached_hashes.txt"
     CURRENT_OFFSET=$(( CURRENT_OFFSET + GRAB_COUNT ))
-    printf "\rCache Check: %d/%d (Current Batch Size: %d)   " "$CURRENT_OFFSET" "$TOTAL_HASHES" "$CURRENT_BATCH_SIZE"
+    
+    # Progress Bar Update
+    BARS=$(( CURRENT_OFFSET * 40 / TOTAL_HASHES ))
+    [ "$BARS" -gt 0 ] && BAR_STR=$(printf '%*s' "$BARS" "" | tr ' ' '#') || BAR_STR=""
+    printf "\rCache Check: [%-40s] %d/%d (Batch: %d)   " "$BAR_STR" "$CURRENT_OFFSET" "$TOTAL_HASHES" "$CURRENT_BATCH_SIZE"
 done
 echo ""
 
@@ -253,8 +249,13 @@ while IFS= read -r HASH; do
         fi
         break
     done
-    printf "\rAdding: %d/%d" "$COUNTER" "$CACHED_HASHES"
-    sleep 0.25 # Small delay to respect baseline limits
+    
+    # Progress Bar Update
+    BARS=$(( COUNTER * 40 / CACHED_HASHES ))
+    [ "$BARS" -gt 0 ] && BAR_STR=$(printf '%*s' "$BARS" "" | tr ' ' '#') || BAR_STR=""
+    printf "\rAdding: [%-40s] %d/%d   " "$BAR_STR" "$COUNTER" "$CACHED_HASHES"
+    
+    sleep 0.25
 done < "$TEMP_DIR/raw_cached_hashes.txt"
 
 echo -e "\nProcess complete."
