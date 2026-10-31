@@ -107,7 +107,7 @@ jq -r --arg Q "$QUALITIES" '
     [$b3d, $b4k, $b1080, $bSD] | map(select(. != null)) | first | .hash // empty
 ' "$TEMP_DIR"/page_*.json | sort -u > "$TEMP_DIR/selected_torrents.txt"
 
-echo "Selection complete. Found $(wc -l < "$TEMP_DIR/selected_torrents.txt") unique torrents."
+echo "Selection complete. Found $(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ') unique torrents."
 
 # --- PHASE 2: Adult Filtering ---
 if [ "$NO_ADULT" = true ]; then
@@ -127,14 +127,58 @@ if [ "$NO_ADULT" = true ]; then
     mv "$TEMP_DIR/filtered_torrents.txt" "$TEMP_DIR/selected_torrents.txt"
 fi
 
-# --- PHASE 3: Torbox Cache Check (Dynamic Batching) ---
+# --- PHASE 3: Exclude Already Owned Torrents ---
+echo "Fetching your existing TorBox library to prevent duplicates..."
+touch "$TEMP_DIR/existing_torrents.txt"
+MYLIST_OFFSET=0
+MYLIST_LIMIT=10000
+
+while true; do
+    RES=$(curl -s -w "\n%{http_code}" -X GET "https://api.torbox.app/v1/api/torrents/mylist?limit=$MYLIST_LIMIT&offset=$MYLIST_OFFSET" \
+        -H "Authorization: Bearer $TORBOX_API_KEY")
+    
+    STATUS=$(echo "$RES" | tail -n1)
+    BODY=$(echo "$RES" | sed '$d')
+    
+    if [ "$STATUS" -eq 429 ]; then
+        echo -e "\nRate limited. Waiting 15s..."
+        sleep 15
+        continue
+    elif [[ "$STATUS" =~ ^50[0-4]$ ]]; then
+        echo -e "\nServer overloaded ($STATUS). Waiting 15s..."
+        sleep 15
+        continue
+    elif [ "$STATUS" -ne 200 ]; then
+        echo -e "\nWarning: Failed to fetch mylist (Status: $STATUS). Proceeding without duplicate check."
+        break
+    fi
+    
+    DATA_LENGTH=$(echo "$BODY" | jq '.data | length // 0')
+    if [ "$DATA_LENGTH" -eq 0 ]; then
+        break 
+    fi
+    
+    echo "$BODY" | jq -r '.data[]? | select(.download_state == "cached") | .hash // empty' >> "$TEMP_DIR/existing_torrents.txt"
+    
+    MYLIST_OFFSET=$(( MYLIST_OFFSET + MYLIST_LIMIT ))
+    printf "\rFetched %d items from your library..." "$MYLIST_OFFSET"
+done
+
+EXISTING_COUNT=$(wc -l < "$TEMP_DIR/existing_torrents.txt" | tr -d ' ')
+echo -e "\nFound $EXISTING_COUNT successfully cached torrents in your account."
+
+awk 'NR==FNR{seen[$1]; next} !($1 in seen)' "$TEMP_DIR/existing_torrents.txt" "$TEMP_DIR/selected_torrents.txt" > "$TEMP_DIR/new_selected_torrents.txt"
+mv "$TEMP_DIR/new_selected_torrents.txt" "$TEMP_DIR/selected_torrents.txt"
+
+echo "Remaining new torrents to process: $(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ')"
+
+# --- PHASE 4: Torbox Cache Check (Dynamic Batching) ---
 # Calculate maximum safe hashes per batch based on OS ARG_MAX limit
-# (Roughly 50 bytes per hash string formatting). Default to 2MB if unreadable.
 OS_ARG_MAX=$(getconf ARG_MAX 2>/dev/null || echo 2097152)
 SAFE_ARG_MAX=$(( OS_ARG_MAX * 9 / 10 ))
 CURRENT_BATCH_SIZE=$(( SAFE_ARG_MAX / 50 ))
 
-# Cap at 10,000 as that's about ~468KB, under 512KB limit.
+# Cap at 10,000 to prevent API payload/timeout errors based on server limits
 if [ "$CURRENT_BATCH_SIZE" -gt 10000 ]; then CURRENT_BATCH_SIZE=10000; fi
 
 TOTAL_HASHES=$(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ')
@@ -188,9 +232,9 @@ while [ "$CURRENT_OFFSET" -lt "$TOTAL_HASHES" ]; do
 done
 echo ""
 
-# --- PHASE 4: Add to TorBox ---
+# --- PHASE 5: Add to TorBox ---
 CACHED_HASHES=$(wc -l < "$TEMP_DIR/raw_cached_hashes.txt" | tr -d ' ')
-echo "Adding $CACHED_HASHES torrents to TorBox..."
+echo "Adding $CACHED_HASHES new cached torrents to TorBox..."
 COUNTER=0
 
 while IFS= read -r HASH; do
