@@ -143,14 +143,8 @@ if [ "$NO_ADULT" = true ]; then
     awk -F',' 'NR==FNR { adult_ids[$1]; next } !($1 in adult_ids) { print $2 }' \
     "$TEMP_DIR/adult_imdb_ids.txt" \
     "$TEMP_DIR/hash_to_imdb_map.txt" > "$TEMP_DIR/filtered_torrents.txt"
-
     mv "$TEMP_DIR/filtered_torrents.txt" "$TEMP_DIR/selected_torrents.txt"
-    
 fi
-
-
-
-mv "$TEMP_DIR/filtered_torrents.txt" "$TEMP_DIR/selected_torrents.txt"
 
 # --- PHASE 3: Torbox Cache Check ---
 # Check if hash is cached on Torbox
