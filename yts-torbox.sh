@@ -6,7 +6,6 @@ LANGUAGE="en"
 NO_ADULT=true
 QUALITIES="2160p,1080p,720p,480p"
 THREADS=100
-BATCH_SIZE=2500 # ARG_MAX limitation (<128 Bytes to support any OS)
 
 YTS_BASE_URL="https://movies-api.accel.li/api/v2/list_movies.json?limit=50"
 TORBOX_CHECK_URL="https://api.torbox.app/v1/api/torrents/checkcached"
@@ -45,17 +44,15 @@ TEMP_DIR=$(mktemp -d)
 IMDB_FILE="$TEMP_DIR/title.basics.tsv"
 
 cleanup() { rm -rf "$TEMP_DIR"; }
-# trap cleanup EXIT
+trap cleanup EXIT
 
 # --- PHASE 0: Setup ---
 if [ "$NO_ADULT" = true ]; then
     echo "Downloading IMDB dataset for filtering..."
-    curl -L -o "$TEMP_DIR/title.basics.tsv.gz" "$IMDB_URL" && gunzip "$TEMP_DIR/title.basics.tsv.gz"
+    curl -L -o "$TEMP_DIR/title.basics.tsv.gz" "$IMDB_URL" && gunzip -f "$TEMP_DIR/title.basics.tsv.gz"
 fi
 
 # --- PHASE 1: YTS Scrape & Priority Scoring  ---
-# Scrapes all hashes from the YTS API
-# Scores the quality based on the logic x265>x264, BluRay>Web
 echo "Initializing..."
 INIT_URL="${YTS_BASE_URL}&page=1"
 [[ "$LANGUAGE" != "all" ]] && INIT_URL="${INIT_URL}&language=$LANGUAGE"
@@ -66,7 +63,6 @@ TOTAL_PAGES=$(( (MOVIE_COUNT + 49) / 50 ))
 
 echo "Scraping $TOTAL_PAGES pages with $THREADS threads..."
 
-# Fetch a single page, with error handling (429 and non 200 codes)
 fetch_page() {
     local PAGE=$1
     local OUT_FILE="$TEMP_DIR/page_${PAGE}.json"
@@ -79,7 +75,6 @@ fetch_page() {
         if [ "$STATUS" -eq 429 ]; then sleep 5; continue; fi
         if [ "$STATUS" -ne 200 ]; then echo "Status ${STATUS} for page ${PAGE}. Retrying..."; continue; fi
 
-        # Score based on priority logic (bluray>web, x265>x264)
         echo "$RESPONSE" | sed '$d' | jq -c '.data.movies[]? | {imdb: .imdb_code, torrents: [.torrents[]? | . + {
             score: ((if .video_codec == "x265" then 2 else 1 end) + (if .type == "bluray" then 2 else 1 end)),
             is3d: (.quality == "3D")
@@ -88,7 +83,6 @@ fetch_page() {
     done
 }
 
-# Fetch all pages with multi threading
 for PAGE in $(seq 1 $TOTAL_PAGES); do
     while [ $(jobs -rp | wc -l) -ge "$THREADS" ]; do sleep 0.05; done
     fetch_page "$PAGE" &
@@ -97,21 +91,12 @@ for PAGE in $(seq 1 $TOTAL_PAGES); do
 done
 
 wait
-echo "Applying priority logic (Qualities: $QUALITIES)..."
+echo -e "\nApplying priority logic (Qualities: $QUALITIES)..."
 
-# Process all scraped JSON files. 
-# This handles the extraction, validation, quality sorting, and fallback logic 
-# in a single, error-resistant pass without needing 'cat' or 'group_by'.
 jq -r --arg Q "$QUALITIES" '
     def has_q(val): ($Q | split(",")) | contains([val]);
-    
-    # 1. Smart extractor: Handles both YTS API wrapper and direct object format
     (if .data and .data.movies then .data.movies[] else . end) | 
-    
-    # 2. Strict guardrail: Only proceed if we have a valid torrents array
     select(type == "object" and .torrents != null and (.torrents | type) == "array") |
-    
-    # 3. Enter the array and sort into our quality buckets
     .torrents | 
     (if has_q("3D") then (map(select(.quality == "3D")) | sort_by(.score) | last) else null end) as $b3d |
     (if has_q("2160p") then (map(select(.quality == "2160p")) | sort_by(.score) | last) else null end) as $b4k |
@@ -119,80 +104,113 @@ jq -r --arg Q "$QUALITIES" '
     (if (has_q("720p") or has_q("480p")) then 
         (if ($b4k == null and $b1080 == null) then (map(select(.quality == "720p" or .quality == "480p")) | sort_by(.score) | last) else null end) 
      else null end) as $bSD |
-     
-    # 4. Pick the highest priority bucket that has a result and output the hash
     [$b3d, $b4k, $b1080, $bSD] | map(select(. != null)) | first | .hash // empty
 ' "$TEMP_DIR"/page_*.json | sort -u > "$TEMP_DIR/selected_torrents.txt"
 
 echo "Selection complete. Found $(wc -l < "$TEMP_DIR/selected_torrents.txt") unique torrents."
+
 # --- PHASE 2: Adult Filtering ---
-# Uses IMDB 'adult' identifer to filter out porn / gore.
 if [ "$NO_ADULT" = true ]; then
     echo "Filtering adult content..."
 
-    # 1. Create mapping: IMDB_ID -> Hash
     cat "$TEMP_DIR"/page_*.json | jq -r '.imdb + "," + (.torrents[].hash)' > "$TEMP_DIR/hash_to_imdb_map.txt"
 
-    # 2. Extract unique IMDB IDs from our selection and find which are "adult"
     awk -F'\t' 'NR==FNR { adult_imdb_set[$1]; next } 
                 $5=="1" && ($1 in adult_imdb_set)' \
         <(awk -F',' 'NR==FNR{hashes[$1]; next} ($2 in hashes) {print $1}' "$TEMP_DIR/selected_torrents.txt" "$TEMP_DIR/hash_to_imdb_map.txt" | sort -u) \
         "$IMDB_FILE" > "$TEMP_DIR/adult_imdb_ids.txt"
 
-    # 3. Final Filter: Only keep hashes whose IMDB ID is NOT in the adult_imdb_ids.txt
     awk -F',' 'NR==FNR { adult_ids[$1]; next } !($1 in adult_ids) { print $2 }' \
     "$TEMP_DIR/adult_imdb_ids.txt" \
     "$TEMP_DIR/hash_to_imdb_map.txt" > "$TEMP_DIR/filtered_torrents.txt"
+
     mv "$TEMP_DIR/filtered_torrents.txt" "$TEMP_DIR/selected_torrents.txt"
 fi
 
-# --- PHASE 3: Torbox Cache Check ---
-# Check if hash is cached on Torbox in a single API call
-echo "Checking cache for all torrents..."
+# --- PHASE 3: Torbox Cache Check (Dynamic Batching) ---
+# Calculate maximum safe hashes per batch based on OS ARG_MAX limit
+# (Roughly 50 bytes per hash string formatting). Default to 2MB if unreadable.
+OS_ARG_MAX=$(getconf ARG_MAX 2>/dev/null || echo 2097152)
+SAFE_ARG_MAX=$(( OS_ARG_MAX * 9 / 10 ))
+CURRENT_BATCH_SIZE=$(( SAFE_ARG_MAX / 50 ))
 
-# 1. Build the JSON payload file directly to bypass OS ARG_MAX limits
-jq -R . < "$TEMP_DIR/selected_torrents.txt" | jq -s '{hashes: .}' > "$TEMP_DIR/cache_payload.json"
+# Cap at 50,000 to prevent local memory issues even on huge systems
+if [ "$CURRENT_BATCH_SIZE" -gt 50000 ]; then CURRENT_BATCH_SIZE=50000; fi
 
-while true; do
-    # 2. Send the file payload using -d @file
+TOTAL_HASHES=$(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ')
+CURRENT_OFFSET=0
+touch "$TEMP_DIR/raw_cached_hashes.txt"
+
+echo "Starting dynamic cache check. Max batch size: $CURRENT_BATCH_SIZE..."
+
+# Loop dynamically through the list using offset logic
+while [ "$CURRENT_OFFSET" -lt "$TOTAL_HASHES" ]; do
+    REMAINING=$(( TOTAL_HASHES - CURRENT_OFFSET ))
+    GRAB_COUNT=$(( CURRENT_BATCH_SIZE < REMAINING ? CURRENT_BATCH_SIZE : REMAINING ))
+    
+    # Extract the exact block of hashes for this attempt
+    tail -n +$(( CURRENT_OFFSET + 1 )) "$TEMP_DIR/selected_torrents.txt" | head -n "$GRAB_COUNT" > "$TEMP_DIR/current_batch.txt"
+    
+    jq -R . < "$TEMP_DIR/current_batch.txt" | jq -s '{hashes: .}' > "$TEMP_DIR/current_payload.json"
+    
     RES=$(curl -s -w "\n%{http_code}" -X POST "$TORBOX_CHECK_URL" \
         -H "Authorization: Bearer $TORBOX_API_KEY" \
         -H "Content-Type: application/json" \
-        -d @"$TEMP_DIR/cache_payload.json")
+        -d @"$TEMP_DIR/current_payload.json")
         
     STATUS=$(echo "$RES" | tail -n1)
     
-    if [ "$STATUS" -eq 429 ]; then 
-        echo "Rate limited. Waiting 15 seconds..."
+    if [ "$STATUS" -eq 429 ]; then
+        echo -e "\nRate limited (429). Waiting 15s..."
         sleep 15
         continue
-    fi
-    if [ "$STATUS" -ne 200 ]; then 
-        echo "Error: API returned status $STATUS"
+    elif [[ "$STATUS" =~ ^50[0-4]$ ]] || [ "$STATUS" -eq 413 ] || [ "$STATUS" -eq 400 ]; then
+        # Handle 5xx errors or Payload Too Large by halving the batch size
+        NEW_BATCH=$(( CURRENT_BATCH_SIZE / 2 ))
+        if [ "$NEW_BATCH" -lt 50 ]; then
+            echo -e "\nFatal: Server keeps rejecting even small batches (Status: $STATUS). Response:"
+            echo "$RES" | sed '$d'
+            break
+        fi
+        echo -e "\nServer returned $STATUS. Dropping batch size from $CURRENT_BATCH_SIZE to $NEW_BATCH..."
+        CURRENT_BATCH_SIZE=$NEW_BATCH
+        sleep 5
+        continue # Retries the loop without increasing CURRENT_OFFSET
+    elif [ "$STATUS" -ne 200 ]; then
+        echo -e "\nFatal Error: API returned status $STATUS"
         break
     fi
     
-    # 3. Extract successful hashes
-    echo "$RES" | sed '$d' | jq -r '.data | keys[]?' > "$TEMP_DIR/raw_cached_hashes.txt"
-    break
+    # Success: Save output and advance the offset
+    echo "$RES" | sed '$d' | jq -r '.data | keys[]?' >> "$TEMP_DIR/raw_cached_hashes.txt"
+    CURRENT_OFFSET=$(( CURRENT_OFFSET + GRAB_COUNT ))
+    printf "\rCache Check: %d/%d (Current Batch Size: %d)   " "$CURRENT_OFFSET" "$TOTAL_HASHES" "$CURRENT_BATCH_SIZE"
 done
+echo ""
 
 # --- PHASE 4: Add to TorBox ---
-# Add torrent to Torbox
-# Sleep 15 on 429 rate limit
 CACHED_HASHES=$(wc -l < "$TEMP_DIR/raw_cached_hashes.txt" | tr -d ' ')
-echo -e "\nAdding $CACHED_HASHES torrents to TorBox..."
+echo "Adding $CACHED_HASHES torrents to TorBox..."
 COUNTER=0
+
 while IFS= read -r HASH; do
     [ -z "$HASH" ] && continue
     ((COUNTER++))
     while true; do
-        RES=$(curl -s -w "\n%{http_code}" -X POST "$TORBOX_CREATE_URL" -H "Authorization: Bearer $TORBOX_API_KEY" -F "magnet=magnet:?xt=urn:btih:$HASH")
-        if [ "$(echo "$RES" | tail -n1)" -eq 429 ]; then sleep 15; continue; fi
+        RES=$(curl -s -w "\n%{http_code}" -X POST "$TORBOX_CREATE_URL" \
+            -H "Authorization: Bearer $TORBOX_API_KEY" \
+            -F "magnet=magnet:?xt=urn:btih:$HASH")
+            
+        STATUS=$(echo "$RES" | tail -n1)
+        
+        if [ "$STATUS" -eq 429 ]; then 
+            sleep 15
+            continue
+        fi
         break
     done
     printf "\rAdding: %d/%d" "$COUNTER" "$CACHED_HASHES"
-    sleep 0.21
+    sleep 0.25 # Small delay to respect baseline limits
 done < "$TEMP_DIR/raw_cached_hashes.txt"
 
 echo -e "\nProcess complete."
