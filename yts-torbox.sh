@@ -134,7 +134,7 @@ OS_ARG_MAX=$(getconf ARG_MAX 2>/dev/null || echo 2097152)
 SAFE_ARG_MAX=$(( OS_ARG_MAX * 9 / 10 ))
 CURRENT_BATCH_SIZE=$(( SAFE_ARG_MAX / 50 ))
 
-# Cap at 50,000 to prevent local memory issues even on huge systems
+# Cap at 10,000 as that's about ~468KB, under 512KB limit.
 if [ "$CURRENT_BATCH_SIZE" -gt 10000 ]; then CURRENT_BATCH_SIZE=10000; fi
 
 TOTAL_HASHES=$(wc -l < "$TEMP_DIR/selected_torrents.txt" | tr -d ' ')
