@@ -147,25 +147,34 @@ if [ "$NO_ADULT" = true ]; then
 fi
 
 # --- PHASE 3: Torbox Cache Check ---
-# Check if hash is cached on Torbox
-echo "Checking cache in batches..."
-split -l "$BATCH_SIZE" "$TEMP_DIR/selected_torrents.txt" "$TEMP_DIR/chunk_"
-touch "$TEMP_DIR/raw_cached_hashes.txt"
-TOTAL_CHUNKS=$(ls -1 "$TEMP_DIR"/chunk_* | wc -l)
-CURRENT_CHUNK=0
+# Check if hash is cached on Torbox in a single API call
+echo "Checking cache for all torrents..."
 
-# Loop through chunks, checking cache status via Torbox API
-for CHUNK in "$TEMP_DIR"/chunk_*; do
-    ((CURRENT_CHUNK++))
-    JSON_HASHES=$(cat "$CHUNK" | jq -R . | jq -s .)
-    while true; do
-        RES=$(curl -s -w "\n%{http_code}" -X POST "$TORBOX_CHECK_URL" -H "Authorization: Bearer $TORBOX_API_KEY" -H "Content-Type: application/json" -d "{\"hashes\": $JSON_HASHES}")
-        if [ "$(echo "$RES" | tail -n1)" -eq 429 ]; then sleep 15; continue; fi
-        echo "$RES" | sed '$d' | jq -r '.data | keys[]?' >> "$TEMP_DIR/raw_cached_hashes.txt"
+# 1. Build the JSON payload file directly to bypass OS ARG_MAX limits
+jq -R . < "$TEMP_DIR/selected_torrents.txt" | jq -s '{hashes: .}' > "$TEMP_DIR/cache_payload.json"
+
+while true; do
+    # 2. Send the file payload using -d @file
+    RES=$(curl -s -w "\n%{http_code}" -X POST "$TORBOX_CHECK_URL" \
+        -H "Authorization: Bearer $TORBOX_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d @"$TEMP_DIR/cache_payload.json")
+        
+    STATUS=$(echo "$RES" | tail -n1)
+    
+    if [ "$STATUS" -eq 429 ]; then 
+        echo "Rate limited. Waiting 15 seconds..."
+        sleep 15
+        continue
+    fi
+    if [ "$STATUS" -ne 200 ]; then 
+        echo "Error: API returned status $STATUS"
         break
-    done
-    printf "\rCache Check: [%-40s] %d/%d" "$(printf '#%.0s' $(seq 1 $((CURRENT_CHUNK * 40 / TOTAL_CHUNKS))))" "$CURRENT_CHUNK" "$TOTAL_CHUNKS"
-    sleep 0.21
+    fi
+    
+    # 3. Extract successful hashes
+    echo "$RES" | sed '$d' | jq -r '.data | keys[]?' > "$TEMP_DIR/raw_cached_hashes.txt"
+    break
 done
 
 # --- PHASE 4: Add to TorBox ---
